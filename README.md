@@ -19,6 +19,14 @@ This project detects pneumonia from chest X-ray images using a fine-tuned Vision
 | Pneumonia Recall | 100% |
 | Normal Precision | 99% |
 
+## 🖼️ Demo Screenshots
+
+### Gradio Demo — Live Prediction
+![Demo](Screenshot_2026-04-18_020416.png)
+
+### Grad-CAM Heatmap — Model Explainability
+![Grad-CAM](gradcam_latest.png)
+
 ## 🏗️ Architecture
 - **Base Model:** google/vit-base-patch16-224 (pretrained on ImageNet)
 - **Fine-tuned on:** Chest X-Ray Images (Pneumonia) — 5,216 training images
