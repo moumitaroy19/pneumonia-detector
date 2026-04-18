@@ -22,7 +22,7 @@ This project detects pneumonia from chest X-ray images using a fine-tuned Vision
 ## 🖼️ Demo Screenshots
 
 ### Gradio Demo — Live Prediction
-![Demo](Screenshot_2026-04-18_020416.png)
+![Demo](Screenshot%202026-04-18%20020416.png)
 
 ### Grad-CAM Heatmap — Model Explainability
 ![Grad-CAM](gradcam_latest.png)
