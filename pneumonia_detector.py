@@ -1,0 +1,227 @@
+# =============================================================================
+# Project 1 -- Pneumonia Detection using Vision Transformer (ViT) + Grad-CAM
+# Dataset   : Chest X-Ray Images (Pneumonia) -- Kaggle
+# Model     : google/vit-base-patch16-224 (fine-tuned)
+# =============================================================================
+
+
+# 1. Install Dependencies
+!pip install transformers grad-cam gradio wandb -q
+
+
+# 2. Import Libraries
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from transformers import ViTForImageClassification
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from sklearn.metrics import classification_report, roc_auc_score
+from PIL import Image as PILImage
+import gradio as gr
+
+
+# 3. Mount Drive and Download Dataset
+from google.colab import drive
+drive.mount("/content/drive")
+
+os.makedirs("/root/.kaggle", exist_ok=True)
+os.system("cp /content/drive/MyDrive/kaggle.json /root/.kaggle/")
+os.system("chmod 600 /root/.kaggle/kaggle.json")
+
+os.system("kaggle datasets download -d paultimothymooney/chest-xray-pneumonia")
+os.system("unzip -q chest-xray-pneumonia.zip")
+
+for split in ["train", "test", "val"]:
+    path      = f"chest_xray/{split}"
+    normal    = len(os.listdir(f"{path}/NORMAL"))
+    pneumonia = len(os.listdir(f"{path}/PNEUMONIA"))
+    print(f"{split:5} -- NORMAL: {normal} | PNEUMONIA: {pneumonia}")
+
+
+# 4. Data Preparation
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+train_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+eval_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+train_dataset = datasets.ImageFolder("chest_xray/train", transform=train_transforms)
+val_dataset   = datasets.ImageFolder("chest_xray/val",   transform=eval_transforms)
+test_dataset  = datasets.ImageFolder("chest_xray/test",  transform=eval_transforms)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False)
+test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False)
+
+print(f"Classes    : {train_dataset.classes}")
+print(f"Train size : {len(train_dataset)}")
+print(f"Val size   : {len(val_dataset)}")
+print(f"Test size  : {len(test_dataset)}")
+
+
+# 5. Load Pretrained ViT Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+model = ViTForImageClassification.from_pretrained(
+    "google/vit-base-patch16-224",
+    num_labels=2,
+    ignore_mismatched_sizes=True,
+)
+model = model.to(device)
+print("Model loaded.")
+
+
+# 6. Train the Model
+class_weights = torch.tensor([3.0, 1.0]).to(device)
+criterion     = nn.CrossEntropyLoss(weight=class_weights)
+optimizer     = torch.optim.AdamW(model.parameters(), lr=2e-5)
+
+EPOCHS       = 10
+best_val_acc = 0.0
+
+for epoch in range(EPOCHS):
+    model.train()
+    total_loss = 0
+    correct    = 0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images).logits
+        loss    = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        correct    += (outputs.argmax(1) == labels).sum().item()
+
+    train_acc = correct / len(train_dataset)
+
+    model.eval()
+    val_correct = 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs      = model(images).logits
+            val_correct += (outputs.argmax(1) == labels).sum().item()
+
+    val_acc = val_correct / len(val_dataset)
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), "/content/drive/MyDrive/vit_pneumonia_best.pth")
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Loss: {total_loss:.4f} | Train: {train_acc:.4f} | Val: {val_acc:.4f} [saved]")
+    else:
+        print(f"Epoch {epoch+1:02d}/{EPOCHS} | Loss: {total_loss:.4f} | Train: {train_acc:.4f} | Val: {val_acc:.4f}")
+
+
+# 7. Evaluate on Test Set
+model.eval()
+all_preds, all_labels, all_probs = [], [], []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images).logits
+        probs   = torch.softmax(outputs, dim=1)[:, 1]
+        all_preds.extend(outputs.argmax(1).cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+
+print(classification_report(all_labels, all_preds, target_names=["NORMAL", "PNEUMONIA"]))
+print(f"AUC-ROC: {roc_auc_score(all_labels, all_probs):.4f}")
+
+
+# 8. Grad-CAM Explainability
+class ViTWrapper(nn.Module):
+    """Wraps ViT so Grad-CAM can access logits directly."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x).logits
+
+
+def reshape_transform(tensor, height=14, width=14):
+    """Converts ViT patch-sequence output to a 2D spatial feature map."""
+    result = tensor[:, 1:, :].reshape(tensor.size(0), height, width, tensor.size(2))
+    result = result.transpose(2, 3).transpose(1, 2)
+    return result
+
+
+wrapped_model = ViTWrapper(model)
+target_layers = [model.vit.encoder.layer[-1].layernorm_before]
+cam = GradCAM(model=wrapped_model, target_layers=target_layers, reshape_transform=reshape_transform)
+
+mean = np.array(IMAGENET_MEAN)
+std  = np.array(IMAGENET_STD)
+
+fig, axes = plt.subplots(4, 2, figsize=(10, 20))
+for i in range(4):
+    image, label = test_dataset[i]
+    input_tensor = image.unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        output     = model(input_tensor).logits
+        pred       = output.argmax(1).item()
+        confidence = torch.softmax(output, dim=1).max().item()
+
+    grayscale_cam = cam(input_tensor=input_tensor)[0]
+    img_np = image.permute(1, 2, 0).numpy()
+    img_np = np.clip(std * img_np + mean, 0, 1).astype(np.float32)
+    visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+
+    axes[i, 0].imshow(img_np, cmap="gray")
+    axes[i, 0].set_title(f"Original | True: {test_dataset.classes[label]}")
+    axes[i, 0].axis("off")
+    axes[i, 1].imshow(visualization)
+    axes[i, 1].set_title(f"Grad-CAM | Pred: {test_dataset.classes[pred]} ({confidence:.2%})")
+    axes[i, 1].axis("off")
+
+plt.tight_layout()
+plt.savefig("/content/drive/MyDrive/gradcam_results.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
+# 9. Gradio Demo
+def predict(pil_image):
+    img_tensor = eval_transforms(pil_image).unsqueeze(0).to(device)
+    model.eval()
+    with torch.no_grad():
+        output = model(img_tensor).logits
+        probs  = torch.softmax(output, dim=1)[0]
+
+    grayscale_cam = cam(input_tensor=img_tensor)[0]
+    img_np = eval_transforms(pil_image).permute(1, 2, 0).numpy()
+    img_np = np.clip(std * img_np + mean, 0, 1).astype(np.float32)
+    heatmap_pil = PILImage.fromarray(show_cam_on_image(img_np, grayscale_cam, use_rgb=True))
+
+    return {"NORMAL": float(probs[0]), "PNEUMONIA": float(probs[1])}, heatmap_pil
+
+
+demo = gr.Interface(
+    fn=predict,
+    inputs=gr.Image(type="pil", label="Upload Chest X-Ray"),
+    outputs=[gr.Label(label="Prediction"), gr.Image(type="pil", label="Grad-CAM Heatmap")],
+    title="Pneumonia Detector",
+    description="Upload a chest X-ray to detect pneumonia with Grad-CAM explainability.",
+)
+demo.launch(share=True)
